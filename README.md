@@ -8,11 +8,11 @@ So basically, this project started from me wanting to do free marketing for Null
 
 After the Delusional Descension update for Nullscape was released, I realized the program (originally just a single Python script) was lacking automatic icon updates. I decided it was best for myself and everyone who might be interested in using this program if I made it so user action is never required. You would install it once and it would just work, like any other complete piece of software would. And so, I ended up doing exactly that!
 
-On top of being basically UX heaven with zero user interaction after its one-click install, the program is also designed for maximum portability. It only uses one directory for everything, meaning you can even put it onto a USB stick and run it on any PC without leaving a single trace of its existence on said PC, even though it has auto-updates now. Very cool.
+On top of being basically UX heaven with zero user interaction after its one-click install, the program is also designed for maximum portability. It only uses one directory for everything, meaning you can even put it onto a USB stick and run it on any PC without leaving a single trace of its existence on said PC, even though it has automatic icon updates now. Very cool.
 
 Anyway. At the end of the day this project is really not that special. Simply put, it's an overengineered script for adding Discord RPC to Nullscape. I just really enjoyed writing about it because I think it came out pretty cool. And because I'm autistic. Meow! :3
 
 ## Usage
-1. [Download the installer](https://github.com/Kamppix/NullscapeDiscordRPC/releases/latest).
-2. Run the installer, configure settings according to your preferences, and click "Install".
+1. Download the installer or portable version from the [latest release](https://github.com/Kamppix/NullscapeDiscordRPC/releases/latest).
+2. Run the installer, configure settings according to your preferences, and click "Install" OR unzip the portable zip file into your desired installation folder.
 3. Done! You can now start the program via a "Nullscape" shortcut or directly from the installation folder.
