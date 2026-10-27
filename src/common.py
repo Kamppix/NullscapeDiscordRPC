@@ -12,8 +12,9 @@ GAME_NAME = "Nullscape"               # the only place either name is spelled ou
 APP_NAME = GAME_NAME + "DiscordRPC"   # program, folder, exe and log names
 APP_EXE = APP_NAME + ".exe"
 UNINSTALL_EXE = "uninstall.exe"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 PUBLISHER = "Kamppix"
+REPO_URL = f"https://github.com/{PUBLISHER}/{APP_NAME}"
 SHORTCUT_NAME = GAME_NAME + ".lnk"   # shortcuts are named after the game, not the program
 
 PLACE_ID = 129279692364812

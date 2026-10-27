@@ -274,7 +274,7 @@ class InstallerApp:
             "Choose an installation folder and any shortcuts you want to have. "
             "Moving the installation folder afterwards will mess up shortcuts and the "
             "Windows \"installed apps\" list, so if you want to move it afterwards, "
-            "I recommend just reinstalling the program. "
+            "it is recommended to instead reinstall the program. "
         )).pack(anchor="w", pady=(6, 14))
 
         box = ttk.LabelFrame(f, text="Installation folder", padding=10)

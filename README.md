@@ -1,5 +1,5 @@
 # NullscapeDiscordRPC
-A program that opens Nullscape and shows it as your rich presence activity on Discord instead of Roblox.
+A program that opens [Nullscape](https://www.roblox.com/games/129279692364812/Nullscape) and shows it as your rich presence activity on Discord instead of Roblox.
 
 Fully made using Claude because I was honestly really lazy and wanted to get this done quickly. Sue me.
 

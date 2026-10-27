@@ -138,7 +138,7 @@ class UninstallerApp:
         ttk.Label(f, wraplength=490, justify="left", text="Are you sure you want to uninstall?").pack(anchor="w", pady=(10, 4))
         ttk.Label(f, wraplength=490, justify="left", text="This will remove:").pack(anchor="w", pady=(10, 4))
         self.shortcuts = detect_shortcuts(self.install_dir)
-        lines = [f"- the installation folder  {self.install_dir}", "- the Windows app list entry"]
+        lines = [f"- the installation folder at {self.install_dir}", "- the Windows app list entry"]
         lines += [f"- the {label} shortcut" for label, _ in self.shortcuts]
         ttk.Label(f, wraplength=490, justify="left", text="\n".join(lines)).pack(anchor="w", padx=(10, 0))
         btns = ttk.Frame(f)
