@@ -332,13 +332,12 @@ def try_connect():
 
 
 def format_duration(seconds):
-    """"0 minutes played", "1 minute played", "1 hour 2 minutes played", "2 hours played" (hours
-    only once there are any, and no "0 minutes" after them). "Played" rather than "in", as when
-    you join a run in progress this is only your part of it."""
+    """"0min played", "12min played", "1h 2min played", "2h played" (hours only once there are
+    any, and no "0min" after them). "Played" rather than "in", as when you join a run in
+    progress this is only your part of it."""
     minutes = max(0, int(seconds)) // 60
     hours, minutes = minutes // 60, minutes % 60
-    plural = lambda n, word: f"{n} {word}" + ("" if n == 1 else "s")
-    parts = ([plural(hours, "hour")] if hours else []) + ([plural(minutes, "minute")] if minutes or not hours else [])
+    parts = ([f"{hours}h"] if hours else []) + ([f"{minutes}min"] if minutes or not hours else [])
     return " ".join(parts) + " played"
 
 
@@ -513,7 +512,7 @@ def main(takeover_event):
             while recent_updates and now - recent_updates[0] >= DISCORD_RATE_LIMIT[1]:
                 recent_updates.popleft()
             if rpc is not None and len(recent_updates) < DISCORD_RATE_LIMIT[0]:
-                # Only when what's shown changes (incl. the minutes in "Level 3 · 12 minutes played"); if the rate
+                # Only when what's shown changes (incl. the minutes in "Level 3 · 12min played"); if the rate
                 # limit holds an update back, it goes out on a later pass as soon as it's allowed.
                 try:
                     if game is not None:
