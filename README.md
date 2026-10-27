@@ -15,4 +15,4 @@ Anyway. At the end of the day this project is really not that special. Simply pu
 ## Usage
 1. [Download the installer](https://github.com/Kamppix/NullscapeDiscordRPC/releases/latest).
 2. Run the installer, configure settings according to your preferences, and click "Install".
-3. Done! You can now start the program via a shortcut or directly from the installation directory.
+3. Done! You can now start the program via a "Nullscape" shortcut or directly from the installation directory.
