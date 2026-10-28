@@ -51,7 +51,8 @@ if exist "%BUILD_TEMP%\" rmdir "%BUILD_TEMP%" /s /q
 mkdir "%BUILD_TEMP%" || goto :fail
 
 echo Installing build dependencies...
-python -m pip install --upgrade pyinstaller pypresence psutil requests pillow || goto :fail
+:: (sv-ttk: the installer/uninstaller theme, light or dark like the system)
+python -m pip install --upgrade pyinstaller pypresence psutil requests pillow sv-ttk || goto :fail
 
 echo Fetching the latest game icon...
 :: Only needed during the build (exe icons, window icons, the portable icon.ico); use
@@ -67,10 +68,11 @@ echo Building %APP_NAME% (the app)...
 %PYI% --clean --name %APP_NAME% --icon "%ICON%" --exclude-module tkinter --hidden-import PIL.IcoImagePlugin --hidden-import PIL.PngImagePlugin "%~dp0src\main.py" || goto :fail
 
 echo Building %UNINSTALL_NAME%.exe...
-%PYI% --onefile --uac-admin --name %UNINSTALL_NAME% --icon "%ICON%" --add-data "%ICON%;." "%~dp0src\uninstaller.py" || goto :fail
+:: No --uac-admin (for the installer either): both ask for admin rights themselves, only when needed
+%PYI% --onefile --name %UNINSTALL_NAME% --icon "%ICON%" --add-data "%ICON%;." "%~dp0src\uninstaller.py" || goto :fail
 
 echo Building the installer...
-%PYI% --onefile --uac-admin --name %APP_NAME%_Setup --icon "%ICON%" --hidden-import PIL.IcoImagePlugin --hidden-import PIL.PngImagePlugin --add-data "%ICON%;." --add-data "%DIST%\%APP_NAME%;payload" --add-data "%DIST%\%UNINSTALL_NAME%.exe;payload" "%~dp0src\installer.py" || goto :fail
+%PYI% --onefile --name %APP_NAME%_Setup --icon "%ICON%" --hidden-import PIL.IcoImagePlugin --hidden-import PIL.PngImagePlugin --add-data "%ICON%;." --add-data "%DIST%\%APP_NAME%;payload" --add-data "%DIST%\%UNINSTALL_NAME%.exe;payload" "%~dp0src\installer.py" || goto :fail
 
 echo Packing the portable version...
 :: icon.ico is made with the app's own converter, so the app sees it as up to date on first launch.

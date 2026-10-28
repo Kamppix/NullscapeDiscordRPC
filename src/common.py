@@ -1,4 +1,5 @@
-"""Helpers shared by the app, installer and uninstaller."""
+"""Helpers shared by the app, installer and uninstaller. Most of it is Windows-only (the Windows
+installer and uninstaller use it); the app's own platform layer is system.py."""
 
 import base64
 import ctypes
@@ -7,15 +8,21 @@ import ntpath
 import os
 import subprocess
 import sys
+import time
 
 GAME_NAME = "Nullscape"               # the only place either name is spelled out
 APP_NAME = GAME_NAME + "DiscordRPC"   # program, folder, exe and log names
 APP_EXE = APP_NAME + ".exe"
 UNINSTALL_EXE = "uninstall.exe"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 PUBLISHER = "Kamppix"
 REPO_URL = f"https://github.com/{PUBLISHER}/{APP_NAME}"
 SHORTCUT_NAME = GAME_NAME + ".lnk"   # shortcuts are named after the game, not the program
+
+# Linux: lowercase, hyphenated command/folder/file names, and a reverse-DNS ID for the desktop
+# entry and the icon (as the freedesktop.org specs recommend)
+LINUX_NAME = GAME_NAME.lower() + "-discord-rpc"
+APP_ID = f"io.github.{PUBLISHER.lower()}.{APP_NAME}"
 
 PLACE_ID = 129279692364812
 UNIVERSE_ID = 7623259179
@@ -24,6 +31,7 @@ UNINSTALL_REG_KEY = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\" 
 
 MUTEX_NAME = "Local\\" + APP_NAME + "_Instance"
 EVENT_NAME = "Local\\" + APP_NAME + "_TakeOver"
+HANDOFF_EVENT_NAME = "Local\\" + APP_NAME + "_ElevatedWindowShown"   # see wait_for_handoff()
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -32,12 +40,95 @@ CSIDL_DESKTOPDIRECTORY = 0x0010
 CSIDL_COMMON_PROGRAMS = 0x0017
 CSIDL_COMMON_DESKTOPDIRECTORY = 0x0019
 
-# Each program sets this to its own logger (the installer/uninstaller leave it silent)
-log_fn = lambda msg: None
+LOG_ARG = "--log"
+LOG_MAX_BYTES = 1_000_000   # a bigger log is moved to <name>.log.old on the next start
+
+_log_path = None   # set by start_log() when started with --log
+
+
+def start_log(source_name):
+    """Set up log() for this program, at its start: with --log, the log goes to a file in the
+    working directory, named after the program (e.g. NullscapeDiscordRPC.log for
+    NullscapeDiscordRPC.exe; source_name when run from source). It's also printed to the console,
+    if there is one: the Windows exes are windowed programs and have none."""
+    global _log_path
+    if LOG_ARG in sys.argv:
+        _log_path = os.path.join(os.getcwd(), log_name(source_name))   # absolute: stays put if the CWD changes
+        try:
+            if os.path.getsize(_log_path) > LOG_MAX_BYTES:
+                os.replace(_log_path, _log_path + ".old")
+        except OSError:
+            pass
+
+
+def program_file():
+    """This program's file name: the exe or AppImage (or the script, when run from source)."""
+    built = os.environ.get("APPIMAGE") or (sys.executable if getattr(sys, "frozen", False) else "")
+    return os.path.basename(built or sys.argv[0])
+
+
+def log_name(source_name):
+    """The --log file's name: the program's, e.g. NullscapeDiscordRPC.log for NullscapeDiscordRPC.exe
+    (source_name + ".log" when run from source)."""
+    if os.environ.get("APPIMAGE") or getattr(sys, "frozen", False):
+        return os.path.splitext(program_file())[0] + ".log"
+    return source_name + ".log"
+
+
+# ------------------------------ Command line ------------------------------
+
+HELP_ARGS = ("-h", "--help")
+
+
+def usage_text(description, options=(), notes=()):
+    """--help text (Linux: the Windows exes have no console to print it to): options is
+    [(option, explanation)]. --log and --help are added."""
+    import textwrap
+    program = program_file()
+    options = list(options) + [
+        (LOG_ARG, "also write the log to a log file in the current folder"),
+        ("-h, --help", "show this help, then exit")]
+    lines = [f"{APP_NAME} {APP_VERSION}", *textwrap.wrap(description, 92), "", f"Usage: {program} [option]", ""]
+    width = max(len(name) for name, _ in options)
+    for name, text in options:
+        wrapped = textwrap.wrap(text, 92 - width) or [""]
+        lines.append(f"  {name.ljust(width)}  {wrapped[0]}")
+        lines += [" " * (width + 4) + more for more in wrapped[1:]]
+    return "\n".join(lines + list(notes))
+
+
+def handle_args(usage, options=(), with_value=()):
+    """Check the command line: with -h/--help//? show the help and exit; with an unknown option,
+    show it with the help and exit with code 2. usage() returns the help text; options are the
+    program's own (besides --log and the help ones), with_value the ones followed by a value."""
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] in with_value:
+            i += 2
+            continue
+        if args[i] not in options and args[i] not in HELP_ARGS and args[i] != LOG_ARG:
+            print(f"Unknown option: {args[i]}\n\n{usage()}")
+            sys.exit(2)
+        i += 1
+    if any(arg in HELP_ARGS for arg in args):
+        print(usage())
+        sys.exit(0)
 
 
 def log(msg):
-    log_fn(msg)
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    if _log_path:
+        try:
+            with open(_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass   # e.g. folder not writable: never let logging break the program
+    if sys.stdout is not None:   # None: no console
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
 
 
 # ------------------------------ Paths ------------------------------
@@ -49,46 +140,175 @@ def resource_path(name):
 
 
 def default_install_dir():
+    """Per user (%LOCALAPPDATA%\\Programs, where Windows keeps per-user apps): needs no admin rights."""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+    return ntpath.join(base, "Programs", APP_NAME)
+
+
+def all_users_install_dir():
+    """For all users (Program Files): needs admin rights."""
     return ntpath.join(os.environ.get("ProgramFiles") or r"C:\Program Files", APP_NAME)
 
 
+def can_write(path):
+    """Can this process create files in path? If it doesn't exist yet: in the nearest existing
+    folder above it, where it would be created."""
+    folder = path
+    while not os.path.isdir(folder):
+        parent = os.path.dirname(folder)
+        if parent == folder:
+            return False
+        folder = parent
+    try:
+        import tempfile
+        fd, probe = tempfile.mkstemp(dir=folder, prefix=".write-test-")
+        os.close(fd)
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
 def normalize_install_dir(path):
-    """Make sure the install directory always ends in ...\\APP_NAME"""
+    """The install directory as a clean absolute path (the folder itself is the user's choice)."""
     p = os.path.expandvars((path or "").strip().strip('"'))
     if not p:
         p = default_install_dir()
+    if len(p) == 2 and p[1] == ":":
+        p += "\\"   # "D:" is the drive (not Windows' "current folder on D:")
     p = ntpath.abspath(p)
     if len(p) > 3:
         p = p.rstrip("\\/")
-    if ntpath.basename(p).lower() != APP_NAME.lower():
-        p = ntpath.join(p, APP_NAME)
     return p
 
 
+def shared_folder_reason(path):
+    """Why path can't be an installation folder (uninstalling deletes the whole folder), or None:
+    a drive root, or a folder that holds other things (Windows, Program Files, the user's profile,
+    Desktop, Documents...)."""
+    if len(ntpath.splitdrive(path)[1].strip("\\/")) == 0:
+        return "a whole drive"
+    env = os.environ.get
+    shared = [env("SystemRoot"), env("ProgramFiles"), env("ProgramFiles(x86)"), env("ProgramW6432"),
+              env("ProgramData"), env("USERPROFILE"), env("APPDATA"), env("LOCALAPPDATA"),
+              ntpath.join(env("LOCALAPPDATA") or "", "Programs"), env("TEMP"),
+              user_folder(CSIDL_DESKTOPDIRECTORY), user_folder(CSIDL_PROGRAMS),
+              known_folder(CSIDL_COMMON_DESKTOPDIRECTORY), known_folder(CSIDL_COMMON_PROGRAMS)]
+    profile = env("USERPROFILE")
+    if profile:
+        shared += [ntpath.join(profile, name) for name in ("Documents", "Downloads", "Music",
+                                                             "Pictures", "Videos", "OneDrive")]
+    if any(same_path(path, folder) for folder in shared if folder):
+        return "a folder that's shared with other things"
+    return None
+
+
 def is_valid_install_dir(path):
-    """Safety check before anything is deleted: right name, and our exe is inside."""
+    """Safety check before anything is deleted: our exe and uninstaller are inside, and it isn't
+    a drive root."""
     return (
         bool(path)
         and len(path) > 3
-        and ntpath.basename(path.rstrip("\\/")).lower() == APP_NAME.lower()
         and os.path.isfile(os.path.join(path, APP_EXE))
+        and os.path.isfile(os.path.join(path, UNINSTALL_EXE))
+        and shared_folder_reason(path) is None
     )
 
 
 def known_folder(csidl):
+    """A shell folder of the account this process runs as."""
     buf = ctypes.create_unicode_buffer(260)
     if ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf) == 0 and buf.value:
         return buf.value
     return None
 
 
+def _session_id(pid):
+    sid = ctypes.c_ulong()
+    return sid.value if ctypes.windll.kernel32.ProcessIdToSessionId(pid, ctypes.byref(sid)) else None
+
+
+def interactive_user():
+    """The person at the keyboard (owner of this session's explorer.exe, as DOMAIN\\name), even if
+    a different administrator approved the UAC prompt and we now run as them."""
+    try:
+        import psutil
+        mine = _session_id(os.getpid())
+        users = [(p.info["pid"], p.info["username"]) for p in psutil.process_iter(["pid", "name", "username"])
+                 if (p.info["name"] or "").lower() == "explorer.exe" and p.info["username"]]
+        for pid, user in users:
+            if _session_id(pid) == mine:
+                return user
+        if users:
+            return users[0][1]
+    except Exception:
+        pass
+    return current_user()
+
+
+def current_user():
+    """The account this process runs as (DOMAIN\\name)."""
+    dom, user = os.environ.get("USERDOMAIN"), os.environ.get("USERNAME")
+    return f"{dom}\\{user}" if dom and user else user
+
+
+# Per-user shell folders, as named under ...\Explorer\User Shell Folders in each user's registry
+_USER_SHELL_FOLDERS = {CSIDL_DESKTOPDIRECTORY: "Desktop", CSIDL_PROGRAMS: "Programs"}
+
+
+def _folder_of_other_user(user, csidl):
+    """A per-user shell folder of another account, read from that user's (loaded) registry."""
+    import winreg
+    from ctypes import wintypes
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    sid_buf, sid_size = ctypes.create_string_buffer(256), wintypes.DWORD(256)
+    dom_buf, dom_size, use = ctypes.create_unicode_buffer(256), wintypes.DWORD(256), wintypes.DWORD()
+    if not advapi.LookupAccountNameW(None, user, sid_buf, ctypes.byref(sid_size),
+                                     dom_buf, ctypes.byref(dom_size), ctypes.byref(use)):
+        return None
+    sid_str = ctypes.c_wchar_p()
+    if not advapi.ConvertSidToStringSidW(sid_buf, ctypes.byref(sid_str)):
+        return None
+    sid = sid_str.value
+    ctypes.windll.kernel32.LocalFree(sid_str)
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                        rf"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}") as k:
+        profile = os.path.expandvars(winreg.QueryValueEx(k, "ProfileImagePath")[0])
+    with winreg.OpenKey(winreg.HKEY_USERS,
+                        rf"{sid}\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as k:
+        raw = winreg.QueryValueEx(k, _USER_SHELL_FOLDERS[csidl])[0]
+    # Expand that user's variables (not ours: we may be running as someone else)
+    for var, value in (("%USERPROFILE%", profile),
+                       ("%APPDATA%", os.path.join(profile, "AppData", "Roaming")),
+                       ("%LOCALAPPDATA%", os.path.join(profile, "AppData", "Local"))):
+        raw = raw.replace(var, value).replace(var.lower(), value)
+    return os.path.expandvars(raw)
+
+
+def user_folder(csidl):
+    """A per-user shell folder (desktop, Start Menu) of the person at the keyboard. Normally the
+    same as known_folder(), but when a different administrator approved the UAC prompt the
+    elevated installer runs as them: their desktop isn't the one that should get the shortcut."""
+    user = interactive_user()
+    if user and current_user() and user.lower() != current_user().lower():
+        try:
+            folder = _folder_of_other_user(user, csidl)
+            if folder:
+                return folder
+        except Exception:
+            pass
+    return known_folder(csidl)
+
+
 def shortcut_locations():
     """Every place outside the installation folder where the installer may have put a shortcut:
-    [(label, full_path)]. (The one inside the folder is simply deleted along with it.)"""
+    [(label, full_path)]. (The one inside the folder is simply deleted along with it.) The desktop
+    and Start Menu ones are the logged-on user's, also when we run as another administrator."""
     spots = [
-        ("desktop", known_folder(CSIDL_DESKTOPDIRECTORY)),
+        ("desktop", user_folder(CSIDL_DESKTOPDIRECTORY)),
         ("desktop (all users)", known_folder(CSIDL_COMMON_DESKTOPDIRECTORY)),
-        ("Start Menu", known_folder(CSIDL_PROGRAMS)),
+        ("Start Menu", user_folder(CSIDL_PROGRAMS)),
         ("Start Menu (all users)", known_folder(CSIDL_COMMON_PROGRAMS)),
     ]
     return [(label, os.path.join(folder, SHORTCUT_NAME)) for label, folder in spots if folder]
@@ -96,19 +316,66 @@ def shortcut_locations():
 
 # ------------------------------ Windows helpers ------------------------------
 
-def ensure_admin():
-    """True if already elevated. Otherwise re-launches elevated and returns False."""
+def same_path(a, b):
+    return bool(a and b) and ntpath.normcase(ntpath.normpath(a)) == ntpath.normcase(ntpath.normpath(b))
+
+
+def registered_location(hive):
+    """InstallLocation of the "installed apps" entry in this registry hive (HKEY_LOCAL_MACHINE: for
+    the whole machine, HKEY_CURRENT_USER: just this user), or None if there's no entry."""
+    import winreg
     try:
-        if ctypes.windll.shell32.IsUserAnAdmin():
-            return True
+        with winreg.OpenKey(hive, UNINSTALL_REG_KEY) as k:
+            return winreg.QueryValueEx(k, "InstallLocation")[0] or ""
+    except OSError:
+        return None
+
+
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
-        return True
-    if getattr(sys, "frozen", False):
-        params = subprocess.list2cmdline(sys.argv[1:])
-    else:
-        params = subprocess.list2cmdline([os.path.abspath(sys.argv[0])] + sys.argv[1:])
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
-    return False
+        return True   # no UAC to ask through
+
+
+def relaunch_elevated(extra_args=()):
+    """Start this program again with administrator rights (Windows shows the UAC prompt), with its
+    current arguments plus extra_args. True if it started, False if the prompt was declined."""
+    args = sys.argv[1:] + list(extra_args)
+    if not getattr(sys, "frozen", False):
+        args = [os.path.abspath(sys.argv[0])] + args
+    # (in the same working directory: without one it would be System32, and --log writes there)
+    return ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable,
+                                               subprocess.list2cmdline(args), os.getcwd(), 1) > 32
+
+
+def prepare_handoff():
+    """Before relaunch_elevated(): create the event the elevated copy signals once its window is
+    on screen (see wait_for_handoff())."""
+    return _k32().CreateEventW(None, True, False, HANDOFF_EVENT_NAME)
+
+
+def wait_for_handoff(root, event, timeout=20.0):
+    """Keep this window up until the elevated copy shows its own (it takes a moment to start), so
+    the installer doesn't seem to vanish; then close it. Never longer than timeout seconds."""
+    deadline = time.monotonic() + timeout
+    root.config(cursor="watch")
+
+    def check():
+        if _k32().WaitForSingleObject(event, 0) == WAIT_OBJECT_0 or time.monotonic() > deadline:
+            close_handle(event)
+            root.destroy()
+        else:
+            root.after(100, check)
+    check()
+
+
+def signal_handoff():
+    """In the elevated copy, once its window is shown: let the original window close."""
+    event = _k32().OpenEventW(EVENT_MODIFY_STATE, False, HANDOFF_EVENT_NAME)
+    if event:
+        _k32().SetEvent(event)
+        close_handle(event)
 
 
 def set_dpi_aware():
@@ -179,6 +446,191 @@ def shortcut_is_ours(path, targets, install_dir):
     return ntpath.normcase(ntpath.normpath(t)) == mine
 
 
+def installed_shortcuts(install_dir):
+    """Every shortcut of ours that actually exists (and points at this installation): [(label, path)]."""
+    existing = [(label, p) for label, p in shortcut_locations() if os.path.isfile(p)]
+    targets = read_shortcut_targets([p for _, p in existing])
+    return [(label, p) for label, p in existing if shortcut_is_ours(p, targets, install_dir)]
+
+
+def installations():
+    """The folders of the installations listed in "installed apps" (at most one for this user,
+    one for the whole machine) that are still there."""
+    import winreg
+    found = []
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        location = registered_location(hive)
+        if is_valid_install_dir(location) and not any(same_path(location, f) for f in found):
+            found.append(location)
+    return found
+
+
+def removal_needs_admin(install_dir, shortcuts):
+    """Does removing this installation need administrator rights? Only if it's in a folder we
+    can't write to (e.g. Program Files), registered for the whole machine, or has shortcuts for
+    all users."""
+    import winreg
+    machine_wide = same_path(registered_location(winreg.HKEY_LOCAL_MACHINE), install_dir)
+    return (not can_write(install_dir) or machine_wide
+            or any("all users" in label for label, _ in shortcuts))
+
+
+def delete_registry_entries(install_dir):
+    """Remove the "installed apps" entry of this installation (machine-wide or per-user), leaving
+    alone an entry that belongs to another installation of ours in a different folder."""
+    import winreg
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        location = registered_location(hive)
+        if location is not None and (location == "" or same_path(location, install_dir)):
+            try:
+                winreg.DeleteKey(hive, UNINSTALL_REG_KEY)
+            except OSError:
+                pass
+
+
+class PlainError(RuntimeError):
+    """An error whose message is already written for the user: friendly_error() shows it as is."""
+
+
+def friendly_error(error):
+    """A short, plain reason for an error shown in the installer/uninstaller: never raw technical
+    output (e.g. PowerShell's error dumps)."""
+    text = str(error)
+    if isinstance(error, PlainError):
+        return text
+    lowered = text.lower()
+    # (before "access denied": Windows reports a locked file as a permission error too)
+    if "being used by another process" in lowered or "[winerror 32]" in lowered:
+        return "in use by another program"
+    if (isinstance(error, PermissionError) or "unauthorizedaccess" in lowered
+            or "access is denied" in lowered or "access denied" in lowered or "[winerror 5]" in lowered):
+        return "access denied"
+    if "folder not found" in lowered:
+        return "folder not found"
+    if isinstance(error, FileNotFoundError):
+        return "file not found"
+    if isinstance(error, RuntimeError) and text and "\n" not in text and "<" not in text:
+        return text   # our own messages are already plain
+    return "unexpected error"
+
+
+def system_uses_dark_theme():
+    """Windows' "app mode" setting (Settings > Personalization > Colors)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+    except OSError:
+        return False
+
+
+def apply_theme(root):
+    """Give the installer/uninstaller window the system's light or dark look: the Sun Valley ttk
+    theme (Windows 11 style) in the matching mode. Falls back to the classic light "vista" theme.
+    Create the window hidden and show it with show_window(), which also sets the title bar to match.
+    Returns colours for text the theme doesn't style itself."""
+    from tkinter import ttk, TclError
+    dark = system_uses_dark_theme()
+    try:
+        import sv_ttk
+        sv_ttk.set_theme("dark" if dark else "light", root)
+        # The theme sets its colours and fonts when the main window gets <<ThemeChanged>>, which a
+        # hidden main window (an error dialog on its own) never does: do it directly
+        root.tk.call("configure_colors")
+    except Exception:
+        dark = False   # the classic theme only comes in light
+        try:
+            ttk.Style(root).theme_use("vista")
+        except TclError:
+            pass
+    root._theme_dark = dark   # for show_window() and dialog()
+    return {"warning": "#f0b060" if dark else "#9a5b00"}
+
+
+def show_window(window):
+    """Show a window that was created hidden, with its title bar already in the theme's light or
+    dark mode, so it never flashes the wrong colour or needs redrawing."""
+    window.update_idletasks()   # the window exists (hidden) from here on
+    _set_title_bar_mode(window, getattr(window, "_theme_dark", False))
+    window.deiconify()
+    window.lift()
+    window.focus_force()
+
+
+def dialog(parent, title, text, buttons=("OK",), default=0):
+    """A small modal message window in the app's theme, used instead of Windows' own message boxes
+    (those ignore dark mode). Returns the index of the button clicked, or None if it was closed."""
+    import tkinter as tk
+    from tkinter import ttk
+    win = tk.Toplevel(parent)
+    win.withdraw()
+    win.title(title)
+    win.resizable(False, False)
+    shown_over_parent = bool(parent.winfo_viewable())
+    if shown_over_parent:
+        win.transient(parent)
+    result = [None]
+
+    def choose(index):
+        result[0] = index
+        win.destroy()
+
+    frame = ttk.Frame(win, padding=(22, 20))
+    frame.pack(fill="both", expand=True)
+    ttk.Label(frame, text=text, wraplength=420, justify="left").pack(anchor="w")
+    row = ttk.Frame(frame)
+    row.pack(fill="x", pady=(20, 0))
+    accent = ttk.Style(win).theme_use().startswith("sun-valley")   # the classic theme has no accent style
+    for index, label in reversed(list(enumerate(buttons))):
+        button = ttk.Button(row, text=label, command=lambda i=index: choose(i),
+                            style="Accent.TButton" if accent and index == default else "TButton")
+        button.pack(side="right", padx=(8, 0))
+        if index == default:
+            button.focus_set()
+    win.bind("<Return>", lambda e: choose(default))
+    win.bind("<Escape>", lambda e: choose(0 if len(buttons) == 1 else None))
+    win.protocol("WM_DELETE_WINDOW", lambda: choose(0 if len(buttons) == 1 else None))
+
+    win.update_idletasks()
+    width, height = win.winfo_reqwidth(), win.winfo_reqheight()
+    if shown_over_parent:
+        x = parent.winfo_rootx() + (parent.winfo_width() - width) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - height) // 3
+    else:
+        x = (win.winfo_screenwidth() - width) // 2
+        y = (win.winfo_screenheight() - height) // 3
+    win.geometry(f"+{x}+{y}")
+    win._theme_dark = getattr(parent, "_theme_dark", False)
+    show_window(win)
+    win.grab_set()
+    parent.wait_window(win)
+    return result[0]
+
+
+def size_window(root, width, pages, min_height=0):
+    """Fix the window at this width and the height of its tallest page (themes differ in how much
+    room their controls need), centred a bit above the middle of the screen."""
+    root.update_idletasks()
+    height = max([min_height] + [page.winfo_reqheight() for page in pages])
+    x = (root.winfo_screenwidth() - width) // 2
+    y = (root.winfo_screenheight() - height) // 3
+    root.geometry(f"{width}x{height}+{x}+{y}")
+
+
+def _set_title_bar_mode(window, dark):
+    """Light or dark title bar for a (not yet shown) window."""
+    try:
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        value = ctypes.c_int(1 if dark else 0)
+        for attribute in (20, 19):   # DWMWA_USE_IMMERSIVE_DARK_MODE (older Windows 10 builds: 19)
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(value),
+                                                          ctypes.sizeof(value)) == 0:
+                break
+    except Exception:
+        pass
+
+
 def set_window_icon(root):
     """Use the game icon (icon.png, bundled at build time) for a Tk window and the ones it opens."""
     png = resource_path("icon.png")
@@ -235,6 +687,18 @@ def run_after_exit(script):
         # and silently never starts without one.
         creationflags=0x00000200 | CREATE_NO_WINDOW,
     )
+
+
+def delete_tree(path):
+    """Delete a folder, including read-only files in it."""
+    import shutil
+    import stat
+
+    def clear_read_only(func, p, _exc):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    shutil.rmtree(path, onexc=clear_read_only) if sys.version_info >= (3, 12) \
+        else shutil.rmtree(path, onerror=clear_read_only)
 
 
 def delete_after_exit(path):
@@ -667,5 +1131,8 @@ def ask_running_instance_to_exit(timeout=10.0):
 
 
 def stop_app(install_dir):
-    if not ask_running_instance_to_exit(10.0):
-        kill_app_processes(install_dir)
+    """Close the app running from this folder: ask it to exit cleanly first (it clears its Discord
+    status), then force-close anything still running from there, also a copy that never answered
+    (e.g. one stuck while starting up)."""
+    ask_running_instance_to_exit(10.0)
+    kill_app_processes(install_dir)

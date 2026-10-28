@@ -1,15 +1,24 @@
 """
-Launches the game (common.GAME_NAME) and shows it as your Discord status.
+Launches the game (common.GAME_NAME) and shows it as your Discord status. Runs on Windows (with
+Roblox's own client) and Linux (with Sober); the differences live in system.py.
 
-Everything this program reads or writes lives in its own folder (next to the exe):
+Windows: everything this program reads or writes lives in its own folder (next to the exe):
   icon.ico                   refreshed on every launch if the game icon changed (the icons inside
                              the app exe and uninstall.exe are updated to match)
-  <APP_NAME>.log             activity log, only written when started with --log
-Nothing is stored in AppData, and no shortcuts are ever created from here (that's the installer's job).
+Nothing is stored in AppData.
+
+Windows: no shortcuts are ever created from here (that's the installer's job).
+
+Linux (an AppImage): nothing is stored at all, unless started with --integrate to add it to the
+desktop. Only then, and from then on kept up to date on every launch:
+  ~/.local/share/applications/<APP_ID>.desktop            menu entry (follows the AppImage if moved)
+  ~/.local/share/icons/hicolor/<size>/apps/<APP_ID>.png   its icon (the current game icon)
+
+Both: with --log, the activity log is written to <program name>.log in the current folder (the
+working directory). On Linux it's also printed to the terminal, and --help lists the options.
 """
 
 import collections
-import glob
 import json
 import os
 import re
@@ -23,6 +32,7 @@ import psutil
 from pypresence import Presence
 
 import common
+import system
 
 # ============================== CONFIG ==============================
 DISCORD_CLIENT_ID = "1559974028591239238"
@@ -37,16 +47,10 @@ DISCORD_RATE_LIMIT = (5, 20)    # Discord accepts at most 5 status updates per 2
 MENU_STATUS = "In the main menu"
 WAITING_STATUS = "Waiting for players"
 RUN_OVER_STATUS = "Run over"
-DISCORD_PROCESS_NAMES = {"discord.exe", "discordptb.exe", "discordcanary.exe", "discorddevelopment.exe"}
 
-FROZEN = getattr(sys, "frozen", False)
-APP_DIR = os.path.dirname(os.path.abspath(sys.executable if FROZEN else __file__))
-PENDING_EXE = os.path.join(APP_DIR, common.APP_EXE + ".new")   # our exe with an updated icon
-LOG_FILE = os.path.join(APP_DIR, common.APP_NAME + ".log")
-LOG_TO_FILE = "--log" in sys.argv
-
-ROBLOX_LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Roblox", "logs")
-PROCESS_NAMES = {"robloxplayerbeta.exe"}
+FROZEN = system.FROZEN
+APP_DIR = system.APP_DIR
+PENDING_EXE = os.path.join(APP_DIR, common.APP_EXE + ".new")   # Windows: our exe with an updated icon
 
 JOIN_PATTERNS = [
     re.compile(r"Joining game '[0-9a-fA-F\-]{36}' place (\d+)"),
@@ -60,29 +64,7 @@ LINE_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z")
 _universe_cache = {}   # place_id -> universe_id
 
 
-# ------------------------------- Logging -------------------------------
-
-def log(msg):
-    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
-    if LOG_TO_FILE:
-        try:
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except OSError:
-            pass  # e.g. folder not writable: never let logging break the app
-    if sys.stdout:  # None when built with --noconsole
-        try:
-            print(line, flush=True)
-        except Exception:
-            pass
-
-
-def trim_log():
-    try:
-        if os.path.getsize(LOG_FILE) > 1_000_000:
-            os.replace(LOG_FILE, LOG_FILE + ".old")
-    except OSError:
-        pass
+log = common.log   # to the console, and with --log to a file (see common.start_log())
 
 
 # --------------------------- Roblox web APIs ---------------------------
@@ -110,7 +92,7 @@ def find_client(ignore_pids=()):
     best = None
     for p in psutil.process_iter(["pid", "name", "create_time"]):
         n = p.info["name"]
-        if n and n.lower() in PROCESS_NAMES and p.info["pid"] not in ignore_pids:
+        if n and n.lower() in system.ROBLOX_PROCESS_NAMES and p.info["pid"] not in ignore_pids:
             ct = p.info["create_time"] or 0
             if best is None or ct > best[1]:
                 best = (p.info["pid"], ct)
@@ -121,16 +103,13 @@ def find_discord():
     """Start time of Discord's main (oldest) process, or None when Discord isn't running.
     Changes only when Discord itself restarts (its helper processes come and go)."""
     times = [p.info["create_time"] for p in psutil.process_iter(["name", "create_time"])
-             if (p.info["name"] or "").lower() in DISCORD_PROCESS_NAMES and p.info["create_time"]]
+             if (p.info["name"] or "").lower() in system.DISCORD_PROCESS_NAMES and p.info["create_time"]]
     return min(times) if times else None
 
 
 def newest_log(min_mtime=None):
-    files = glob.glob(os.path.join(ROBLOX_LOG_DIR, "*.log"))
-    if min_mtime is not None:
-        # Ignore logs from earlier sessions (they may end without a "left game" line)
-        files = [f for f in files if os.path.getmtime(f) >= min_mtime - 5]
-    return max(files, key=os.path.getmtime) if files else None
+    # Ignores logs from earlier sessions (they may end without a "left game" line)
+    return system.newest_roblox_log(min_mtime)
 
 
 def line_timestamp(text, pos):
@@ -261,7 +240,7 @@ def in_target_game(client_start):
 
 def launch_game():
     try:
-        os.startfile(f"roblox://experiences/start?placeId={common.PLACE_ID}")
+        system.open_url(f"roblox://experiences/start?placeId={common.PLACE_ID}")
         log("Launched the game.")
     except Exception as e:
         log(f"Could not launch the game: {e}")
@@ -288,9 +267,13 @@ def update_exe_icons(ico_path):
 
 
 def update_icon():
-    """Runs in the background on every launch; only touches icon.ico (and the exes' icons) if the
-    game icon changed."""
+    """Runs in the background on every launch; only touches the icon if the game icon changed.
+    Windows: icon.ico and the icons inside our exes. Linux: only if integrated with the desktop
+    (--integrate), its menu entry and icon."""
     try:
+        if not system.IS_WINDOWS:
+            system.refresh_integration()
+            return
         ico, changed = common.refresh_icon(APP_DIR)
         if FROZEN:
             if changed:
@@ -395,7 +378,8 @@ def shutdown(rpc):
 
 # -------------------------------- Main --------------------------------
 
-def main(takeover_event):
+def main(instance):
+    """instance: system.Instance (single-instance lock; also wakes us when the client exits)."""
     log("Starting up.")
 
     launched_at = None
@@ -413,7 +397,7 @@ def main(takeover_event):
     started_at = time.time()
     seen_running = False
     dead_pids = set()
-    watch_pid, watch_handle = None, None
+    watched_pid = None
     prev_running = None
     prev_path = None
     prev_summary = None
@@ -447,11 +431,9 @@ def main(takeover_event):
                 if (launched_at is None or client_start >= launched_at - 5
                         or now - started_at > STARTUP_GRACE_SECONDS):
                     seen_running = True
-                if pid != watch_pid:
-                    common.close_handle(watch_handle)
-                    watch_handle = common.open_process_handle(pid)
-                    watch_pid = pid
-                    if watch_handle is None:
+                if pid != watched_pid:
+                    watched_pid = pid
+                    if not instance.watch(pid):
                         log("Couldn't watch the client process directly; falling back to polling.")
             elif seen_running:
                 log("Game client closed.")
@@ -545,41 +527,56 @@ def main(takeover_event):
                 log("Error in main loop (continuing):\n" + err)
                 last_err = err
 
-        # ---- sleep, but wake instantly if a newer instance starts or the client exits ----
-        handles = [takeover_event] + ([watch_handle] if watch_handle else [])
-        idx = common.wait_any(handles, POLL_SECONDS * 1000)
-        if idx == 0:
-            log("A newer instance was launched; handing over.")
+        # ---- sleep, but wake instantly if we're asked to exit or the client exits ----
+        event = instance.wait(POLL_SECONDS)
+        if event == system.STOP:
+            log("Asked to exit (a newer instance was launched, or the system asked us to stop).")
             shutdown(rpc)
             return
-        if idx == 1:  # the client process just ended: re-scan right away
-            dead_pids.add(watch_pid)
-            common.close_handle(watch_handle)
-            watch_handle, watch_pid = None, None
-            continue
-        if idx == -2:
-            time.sleep(POLL_SECONDS)
+        if event == system.EXITED:  # the client process just ended: re-scan right away
+            dead_pids.add(instance.exited_pid)
+            watched_pid = None
+
+
+def usage():
+    """--help text (Linux only: the Windows exe has no console to print it to)."""
+    options = [("--integrate", f"add {common.GAME_NAME} to your applications menu, then exit. Writes only "
+                               "a menu entry (~/.local/share/applications) and its icon "
+                               "(~/.local/share/icons), kept up to date from then on; delete "
+                               "them to undo"),
+               ("--fetch-icon", "download the current game icon to icon.png in the current folder, then exit")]
+    return common.usage_text(f"Launches {common.GAME_NAME} in Sober and shows it as your Discord activity.",
+                             options, ["", "Nothing else is ever stored, unless you use --log."])
 
 
 if __name__ == "__main__":
-    common.log_fn = log
+    if not system.IS_WINDOWS:
+        common.handle_args(usage, ["--fetch-icon", "--integrate"])
+    common.start_log(common.APP_NAME)
 
     if "--fetch-icon" in sys.argv:
-        # Used by build.bat: only downloads icon.png into the current folder (messages go to the console only)
+        # Used by the build scripts: only downloads icon.png into the current folder (messages go to the console only)
         png = common.download_icon_png()
         if png:
             with open(os.path.join(os.getcwd(), "icon.png"), "wb") as f:
                 f.write(png)
         sys.exit(0 if png else 1)
 
+    if "--integrate" in sys.argv:
+        # Linux: add the menu entry and icon (the only files the program ever writes there)
+        system.integrate()
+        log(f"Done: {common.GAME_NAME} is now in your applications menu.")
+        sys.exit(0)
+
     try:
-        if LOG_TO_FILE:
-            trim_log()
-        event = common.acquire_instance_lock()
-        if event is None:
+        instance = system.Instance.acquire()
+        if instance is None:
             log("Couldn't take over from the previous instance; exiting.")
             sys.exit(1)
-        main(event)
+        try:
+            main(instance)
+        finally:
+            instance.close()
     except SystemExit:
         raise
     except Exception:
