@@ -20,8 +20,9 @@ Anyway. At the end of the day this project is really not that special. Simply pu
 
 ### Linux
 Uses [Sober](https://sober.vinegarhq.org) to run Roblox, so install that first if you haven't already.
-1. Download the `.AppImage` file from the [latest release](https://github.com/Kamppix/NullscapeDiscordRPC/releases/latest) and make it executable (`chmod +x NullscapeDiscordRPC-*.AppImage`, or in your file manager's file properties). Now it's ready to start. Enjoy!
-2. (optional) Run the program once with `--integrate` to add "Nullscape" to your applications menu. A menu entry will be added to `~/.local/share/applications/` and an (auto-updating) icon file to `~/.local/share/icons/`. To undo integration, simply delete those two files.
+1. Download the `.AppImage` file from the [latest release](https://github.com/Kamppix/NullscapeDiscordRPC/releases/latest) and make it executable with `chmod +x NullscapeDiscordRPC-*.AppImage`, or through your file manager's file properties.
+2. Done! You can now start the program.
+3. (optional) Run the program once with `--integrate` to add "Nullscape" to your applications menu. A menu entry will be added to `~/.local/share/applications/` and an (auto-updating) icon file to `~/.local/share/icons/`. To undo integration, simply delete those two files.
 
 Requires a reasonably recent distro (glibc 2.36 or newer: e.g. Ubuntu 23.04, Debian 12, Fedora 37).
 
