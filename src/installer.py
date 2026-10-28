@@ -115,38 +115,43 @@ def delete_registry(hive):
         pass
 
 
-def set_aside_old_installation(old):
-    """Move an old installation (one being moved to the new folder) out of the way in one rename,
-    which fails just like deleting it would (a file in use, access denied): then the install
-    stops before anything was changed. It's deleted only once the new one is installed, and put
-    back if installing fails. Returns (the folder it was moved to, its shortcuts)."""
-    shortcuts = common.installed_shortcuts(old)   # (found by where they point, so before moving it)
-    aside = old + ".old"
-    n = 1
-    while os.path.exists(aside):
-        n += 1
-        aside = f"{old}.old{n}"
+def name_clashes(folder, dir_shortcut):
+    """Things in a folder that isn't ours (no APP_EXE in it) that have the names of our files:
+    installing there would replace them. (Anything else in the folder is fine: it's left alone,
+    also when uninstalling.)"""
+    if os.path.isfile(os.path.join(folder, common.APP_EXE)):
+        return []   # ours (an installation or the portable version): updating it is fine
+    names = {common.UNINSTALL_EXE, common.PROGRAM_SUBFOLDER, "icon.ico", common.PENDING_EXE,
+             *common.APP_LOGS, *common.UNINSTALL_LOGS}
     try:
-        for i in range(6):   # files can stay locked for a moment after the app exits
-            try:
-                os.rename(old, aside)
-                break
-            except OSError:
-                if i == 5:
-                    raise
-                time.sleep(0.5)
-    except OSError as e:
-        common.log(f"Couldn't move {old} aside: {e}")
-        raise common.PlainError(f"The old installation in {old} couldn't be removed "
-                           f"({common.friendly_error(e)}). If anything in that folder is open, "
-                           "close it and try again.") from e
-    return aside, shortcuts
+        names.update(os.listdir(payload_dir()))
+    except OSError:
+        pass   # (run from source: no payload)
+    if dir_shortcut:
+        names.add(common.SHORTCUT_NAME)
+    return sorted(n for n in names if os.path.exists(os.path.join(folder, n)))
 
 
-def remove_old_installation(old, aside, shortcuts, new_shortcuts):
+def set_aside_old_installation(old):
+    """Move an old installation's program files (one being moved to the new folder) out of the
+    way, all or nothing (see common.set_aside()): if one can't be moved, the install stops before
+    anything was changed. They're deleted only once the new installation is in place, and put
+    back if installing fails. Returns (staging folder, files moved, its shortcuts)."""
+    shortcuts = common.installed_shortcuts(old)   # (found by where they point, so before moving it)
+    try:
+        staging, moved = common.set_aside(old, common.program_files(old))
+    except common.SetAsideError as e:
+        raise common.PlainError(f"The old installation in {old} couldn't be removed, because "
+                                f"{e.name} couldn't be ({common.friendly_error(e.error)}). If "
+                                f"{common.APP_NAME} is still open, or a file of it is open in another "
+                                "program, close it and try again.") from e
+    return staging, moved, shortcuts
+
+
+def remove_old_installation(old, staging, moved, shortcuts, new_shortcuts):
     """Finish removing an old installation once the new one is installed: its shortcuts (except
-    ones the new installation just took over), its "installed apps" entry, and its files. Returns
-    warnings."""
+    ones the new installation just took over), its "installed apps" entry, and its program files,
+    then its folder if nothing else is in it. Returns warnings."""
     warnings = []
     for label, path in shortcuts:
         if any(common.same_path(path, new) for new in new_shortcuts):
@@ -159,11 +164,11 @@ def remove_old_installation(old, aside, shortcuts, new_shortcuts):
             common.log(f"Couldn't remove {path}: {e}")
             warnings.append(f"Couldn't remove the old {label} shortcut: {common.friendly_error(e)}")
     common.delete_registry_entries(old)
-    try:
-        common.delete_tree(aside)
-    except OSError as e:
-        common.log(f"Couldn't delete {aside} yet ({e}); deleting it once the installer exits.")
-        common.delete_after_exit(aside)
+    common.finish_removal(old, staging, moved)
+    kept = common.leftovers(old)
+    if kept:
+        common.log(f"The old folder {old} stays, it has other things in it: " + ", ".join(kept))
+        warnings.append(common.leftovers_warning(old))
     return warnings
 
 
@@ -175,22 +180,25 @@ def install(opts, status, progress):
     rolled back and the exception is re-raised.
     """
     d = opts["dir"]
-    result = {"warnings": [], "icon": None}
+    # (an old installation may have been uninstalled since it was chosen: nothing to move then)
+    replace = [old for old in opts.get("replace", []) if common.is_valid_install_dir(old)]
+    result = {"warnings": [], "icon": None, "replaced": replace}
     created_dir = not os.path.isdir(d)
     hive = registry_hive()
     made_shortcuts = []                      # only ones this run created (a failed re-install must
     created_registry = not registry_entry_exists(hive)   # not wipe the previous working install)
     new_shortcuts = []                       # all shortcuts of the new installation
-    set_aside = []                           # [(old folder, where it was moved, its shortcuts)]
+    set_aside = []                           # [(old folder, staging folder, files moved, its shortcuts)]
+    created_files = []                       # files that weren't there before (undone on failure)
 
     try:
         status(f"Closing any running copy of {common.APP_NAME}...")
         common.stop_app(d)
-        for old in opts.get("replace", []):
+        for old in replace:
             common.stop_app(old)
         progress(0.02)
 
-        for old in opts.get("replace", []):
+        for old in replace:
             status(f"Removing the old installation in {old}...")
             set_aside.append((old, *set_aside_old_installation(old)))
 
@@ -214,13 +222,18 @@ def install(opts, status, progress):
         for i, (full, rel) in enumerate(files):
             dest = os.path.join(d, rel)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
+            existed = os.path.exists(dest)
             copy_with_retry(full, dest)
+            if not existed:
+                created_files.append(rel)
             if i % 15 == 0 or i == len(files) - 1:
                 status(f"Copying files ({i + 1} of {len(files)})...")
             progress(0.05 + 0.65 * (i + 1) / len(files))
 
         # ---- initial game icon -> icon.ico (used by all shortcuts) ----
         status("Downloading the game icon...")
+        if not os.path.exists(os.path.join(d, "icon.ico")):
+            created_files.append("icon.ico")
         ico, _ = common.refresh_icon(d)
         if not ico and os.path.isfile(common.resource_path("icon.png")):
             # Offline: use the icon from build time; the app updates it on its first launch
@@ -282,9 +295,9 @@ def install(opts, status, progress):
         progress(0.96)
 
         # ---- the old installations this one replaces ----
-        for old, aside, shortcuts in set_aside:
+        for old, staging, moved, shortcuts in set_aside:
             status(f"Removing the old installation in {old}...")
-            result["warnings"] += remove_old_installation(old, aside, shortcuts, new_shortcuts)
+            result["warnings"] += remove_old_installation(old, staging, moved, shortcuts, new_shortcuts)
         set_aside = []
         common.notify_icon_change()
         progress(1.0)
@@ -292,12 +305,8 @@ def install(opts, status, progress):
         return result
 
     except Exception:
-        for old, aside, shortcuts in reversed(set_aside):
-            try:
-                os.rename(aside, old)
-            except OSError as e:
-                common.log(f"Couldn't move {aside} back to {old}: {e}")
-                continue
+        for old, staging, moved, shortcuts in reversed(set_aside):
+            common.put_back(old, staging, moved)
             for _, lnk in shortcuts:   # the ones the new installation took over point back again
                 if any(common.same_path(lnk, new) for new in new_shortcuts):
                     try:
@@ -313,8 +322,13 @@ def install(opts, status, progress):
                 pass
         if created_registry:
             delete_registry(hive)
-        if created_dir:
-            shutil.rmtree(d, ignore_errors=True)
+        # Only the files this run created (never anything else), then the folders that are empty
+        for rel in created_files:
+            try:
+                os.remove(os.path.join(d, rel))
+            except OSError:
+                pass
+        common.remove_empty_folders(d, created_files, folder_too=created_dir)
         raise
 
 
@@ -335,7 +349,6 @@ class InstallerApp:
         self.q = queue.Queue()
         self.installing = False
         self.install_dir = None
-        self.replaced = []
         # Already installed? Then that folder is the one suggested (installing there updates it)
         self.existing = common.installations()
         if self.existing:
@@ -365,52 +378,52 @@ class InstallerApp:
 
     # ---- pages ----
     def _build_options(self):
-        f = ttk.Frame(self.root, padding=20)
+        f = ttk.Frame(self.root, padding=common.px(20))
         ttk.Label(f, text=f"Install {common.APP_NAME}", font=("Segoe UI", 15, "bold")).pack(anchor="w")
-        ttk.Label(f, wraplength=510, justify="left", text=(
+        ttk.Label(f, wraplength=common.px(510), justify="left", text=(
             "Choose an installation folder and any shortcuts you want to have. "
             "Moving the installation folder afterwards will mess up shortcuts and the "
             "Windows \"installed apps\" list, so if you want to move it afterwards, "
             "it is recommended to instead reinstall the program. "
-        )).pack(anchor="w", pady=(6, 14))
+        )).pack(anchor="w", pady=common.px(6, 14))
         if self.existing:
-            ttk.Label(f, wraplength=510, justify="left", text=(
+            ttk.Label(f, wraplength=common.px(510), justify="left", text=(
                 f"{common.APP_NAME} is already installed in:\n" + "\n".join(self.existing) + "\n"
                 "Installing it in the same folder updates it. Choosing another folder moves it there."
-            )).pack(anchor="w", pady=(0, 14))
+            )).pack(anchor="w", pady=common.px(0, 14))
 
         # Presets for the folder and Start Menu settings below; the one that matches is disabled
         presets = ttk.Frame(f)
-        presets.pack(fill="x", pady=(0, 12))
+        presets.pack(fill="x", pady=common.px(0, 12))
         presets.columnconfigure((0, 1), weight=1, uniform="presets")
         self.btn_for_me = ttk.Button(presets, text="Install only for me", command=self.preset_for_me)
-        self.btn_for_me.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.btn_for_me.grid(row=0, column=0, sticky="ew", padx=common.px(0, 4))
         self.btn_for_all = ttk.Button(presets, text="Install for all users", command=self.preset_for_all)
-        self.btn_for_all.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.btn_for_all.grid(row=0, column=1, sticky="ew", padx=common.px(4, 0))
 
-        box = ttk.LabelFrame(f, text="Installation folder", padding=10)
+        box = ttk.LabelFrame(f, text="Installation folder", padding=common.px(10))
         box.pack(fill="x")
         entry = ttk.Entry(box, textvariable=self.var_dir)
         entry.pack(side="left", fill="x", expand=True)
         entry.bind("<FocusOut>", lambda e: self.var_dir.set(common.normalize_install_dir(self.var_dir.get())))
-        ttk.Button(box, text="Browse...", command=self.browse).pack(side="left", padx=(8, 0))
+        ttk.Button(box, text="Browse...", command=self.browse).pack(side="left", padx=common.px(8, 0))
 
-        sc = ttk.LabelFrame(f, text="Shortcuts", padding=10)
-        sc.pack(fill="x", pady=(14, 0))
-        ttk.Checkbutton(sc, variable=self.var_desktop, text="Desktop shortcut").pack(anchor="w", pady=2)
+        sc = ttk.LabelFrame(f, text="Shortcuts", padding=common.px(10))
+        sc.pack(fill="x", pady=common.px(14, 0))
+        ttk.Checkbutton(sc, variable=self.var_desktop, text="Desktop shortcut").pack(anchor="w", pady=common.px(2))
         ttk.Checkbutton(sc, variable=self.var_start, text="Start Menu shortcut",
-                        command=self.on_start_toggle).pack(anchor="w", pady=2)
+                        command=self.on_start_toggle).pack(anchor="w", pady=common.px(2))
         self.chk_all = ttk.Checkbutton(sc, variable=self.var_all_users,
                                        text="For all users")
-        self.chk_all.pack(anchor="w", padx=(24, 0), pady=2)
+        self.chk_all.pack(anchor="w", padx=common.px(24, 0), pady=common.px(2))
         self.on_start_toggle()   # "For all users" is only available with a Start Menu shortcut
         ttk.Checkbutton(sc, variable=self.var_dir_shortcut,
-                        text="Installation folder shortcut").pack(anchor="w", pady=2)
+                        text="Installation folder shortcut").pack(anchor="w", pady=common.px(2))
 
         btns = ttk.Frame(f)
-        btns.pack(side="bottom", fill="x", pady=(18, 0))
+        btns.pack(side="bottom", fill="x", pady=common.px(18, 0))
         ttk.Button(btns, text="Cancel", command=self.root.destroy).pack(side="right")
-        ttk.Button(btns, text="Install", command=self.on_install).pack(side="right", padx=8)
+        ttk.Button(btns, text="Install", command=self.on_install).pack(side="right", padx=common.px(8))
 
         for var in (self.var_dir, self.var_start, self.var_all_users):
             var.trace_add("write", lambda *_: self.update_presets())
@@ -418,19 +431,19 @@ class InstallerApp:
         return f
 
     def _build_progress(self):
-        f = ttk.Frame(self.root, padding=20)
+        f = ttk.Frame(self.root, padding=common.px(20))
         ttk.Label(f, text="Installing...", font=("Segoe UI", 15, "bold")).pack(anchor="w")
-        ttk.Label(f, textvariable=self.var_status, wraplength=510).pack(anchor="w", pady=(20, 8))
-        self.bar = ttk.Progressbar(f, maximum=100, length=500)
+        ttk.Label(f, textvariable=self.var_status, wraplength=common.px(510)).pack(anchor="w", pady=common.px(20, 8))
+        self.bar = ttk.Progressbar(f, maximum=100, length=common.px(500))
         self.bar.pack(anchor="w")
         return f
 
     def _build_done(self):
-        f = ttk.Frame(self.root, padding=20)
+        f = ttk.Frame(self.root, padding=common.px(20))
         ttk.Label(f, text="Installation complete", font=("Segoe UI", 15, "bold")).pack(anchor="w")
-        self.lbl_done = ttk.Label(f, wraplength=510, justify="left")
-        self.lbl_done.pack(anchor="w", pady=(14, 16))
-        self.lbl_warn = ttk.Label(f, wraplength=510, justify="left", foreground=self.colors["warning"])
+        self.lbl_done = ttk.Label(f, wraplength=common.px(510), justify="left")
+        self.lbl_done.pack(anchor="w", pady=common.px(14, 16))
+        self.lbl_warn = ttk.Label(f, wraplength=common.px(510), justify="left", foreground=self.colors["warning"])
         self.lbl_warn.pack(anchor="w")
         btns = ttk.Frame(f)
         btns.pack(side="bottom", fill="x")
@@ -439,7 +452,7 @@ class InstallerApp:
         checks.pack(side="left")
         ttk.Checkbutton(checks, variable=self.var_launch, text=f"Launch {common.GAME_NAME}").pack(anchor="w")
         if getattr(sys, "frozen", False):   # from source the "installer" would be python.exe
-            ttk.Checkbutton(checks, variable=self.var_delete_setup, text="Delete installer").pack(anchor="w", pady=(4, 0))
+            ttk.Checkbutton(checks, variable=self.var_delete_setup, text="Delete installer").pack(anchor="w", pady=common.px(4, 0))
         return f
 
     def show(self, page):
@@ -492,26 +505,24 @@ class InstallerApp:
         if drive and not os.path.exists(drive + "\\"):
             common.dialog(self.root, SETUP_TITLE, f"The drive {drive} doesn't exist.")
             return
-        reason = common.shared_folder_reason(d)
-        if reason:
-            common.dialog(self.root, SETUP_TITLE, f"{d} is {reason}. Uninstalling {common.APP_NAME} "
-                          "later removes its whole installation folder, so choose a folder of its own, "
-                          f"like {common.ntpath.join(d, common.APP_NAME)}.")
+        clashes = name_clashes(d, self.var_dir_shortcut.get())
+        if clashes:
+            # Another program's files with our names: installing would replace them, and
+            # uninstalling would then delete them as ours
+            common.dialog(self.root, SETUP_TITLE,
+                          f"{d} already has files named like {common.APP_NAME}'s own ("
+                          + ", ".join(clashes) + "), probably from another program. Installing here "
+                          "would replace them, so choose another folder.")
             return
-        if os.path.isdir(d) and os.listdir(d) and not os.path.isfile(os.path.join(d, common.APP_EXE)):
-            answer = common.dialog(self.root, SETUP_TITLE,
-                                   f"The folder already exists and contains other files:\n\n{d}\n\n"
-                                   "Uninstalling later removes this entire folder. Install here anyway?",
-                                   buttons=("Yes", "No"))
-            if answer != 0:
-                return
         # Only one installation at a time: one in another folder is moved here (no copies that
-        # aren't in the "installed apps" list are left behind)
+        # aren't in the "installed apps" list are left behind). Looked up again now: one may have
+        # been uninstalled while this window was open.
+        self.existing = common.installations()
         replace = [old for old in self.existing if not common.same_path(old, d)]
         if replace:
             answer = common.dialog(self.root, SETUP_TITLE,
                                    f"{common.APP_NAME} is already installed in:\n\n" + "\n".join(replace)
-                                   + f"\n\nInstalling it in {d} instead moves it there: the old copy is "
+                                   + f"\n\nInstalling it in {d} instead moves it there. The old copy is "
                                    "removed once the new one is installed.",
                                    buttons=("Move it", "Cancel"))
             if answer != 0:
@@ -548,7 +559,6 @@ class InstallerApp:
         d = opts["dir"]
         self.var_dir.set(d)
         self.install_dir = d
-        self.replaced = opts.get("replace", [])
         self.installing = True
         self.bar["value"] = 0
         self.show(self.page_progress)
@@ -579,9 +589,9 @@ class InstallerApp:
                 elif kind == "done":
                     self.installing = False
                     self.done = True
-                    moved = "".join(f"\n\nThe old copy in {old} was removed." for old in self.replaced)
-                    self.lbl_done.config(text=f"{common.APP_NAME} was installed to:\n{self.install_dir}{moved}\n\n"
-                                              "You can remove it any time through Windows Settings > Apps > Installed apps.")
+                    moved = "".join(f"\n\nThe old copy in {old} was removed." for old in val["replaced"])
+                    self.lbl_done.config(text=f"{common.APP_NAME} was installed to:\n{self.install_dir}\n\n"
+                                              f"You can remove it any time through Windows Settings > Apps > Installed apps.{moved}")
                     self.lbl_warn.config(text="\n".join("- " + w for w in val["warnings"]))
                     self.show(self.page_done)
                     return
@@ -600,7 +610,7 @@ class InstallerApp:
         if self.var_launch.get() and self.install_dir:
             launch_without_elevation(os.path.join(self.install_dir, common.APP_EXE))
         if self.done and self.var_delete_setup.get() and getattr(sys, "frozen", False):
-            common.delete_after_exit(sys.executable)   # the setup exe is locked until we exit
+            common.remove_after_exit([sys.executable])   # the setup exe is locked until we exit
         self.root.destroy()
 
     def on_close(self):

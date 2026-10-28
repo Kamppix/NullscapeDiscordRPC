@@ -14,7 +14,7 @@ GAME_NAME = "Nullscape"               # the only place either name is spelled ou
 APP_NAME = GAME_NAME + "DiscordRPC"   # program, folder, exe and log names
 APP_EXE = APP_NAME + ".exe"
 UNINSTALL_EXE = "uninstall.exe"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 PUBLISHER = "Kamppix"
 REPO_URL = f"https://github.com/{PUBLISHER}/{APP_NAME}"
 SHORTCUT_NAME = GAME_NAME + ".lnk"   # shortcuts are named after the game, not the program
@@ -182,37 +182,169 @@ def normalize_install_dir(path):
     return p
 
 
-def shared_folder_reason(path):
-    """Why path can't be an installation folder (uninstalling deletes the whole folder), or None:
-    a drive root, or a folder that holds other things (Windows, Program Files, the user's profile,
-    Desktop, Documents...)."""
-    if len(ntpath.splitdrive(path)[1].strip("\\/")) == 0:
-        return "a whole drive"
-    env = os.environ.get
-    shared = [env("SystemRoot"), env("ProgramFiles"), env("ProgramFiles(x86)"), env("ProgramW6432"),
-              env("ProgramData"), env("USERPROFILE"), env("APPDATA"), env("LOCALAPPDATA"),
-              ntpath.join(env("LOCALAPPDATA") or "", "Programs"), env("TEMP"),
-              user_folder(CSIDL_DESKTOPDIRECTORY), user_folder(CSIDL_PROGRAMS),
-              known_folder(CSIDL_COMMON_DESKTOPDIRECTORY), known_folder(CSIDL_COMMON_PROGRAMS)]
-    profile = env("USERPROFILE")
-    if profile:
-        shared += [ntpath.join(profile, name) for name in ("Documents", "Downloads", "Music",
-                                                             "Pictures", "Videos", "OneDrive")]
-    if any(same_path(path, folder) for folder in shared if folder):
-        return "a folder that's shared with other things"
-    return None
-
-
 def is_valid_install_dir(path):
-    """Safety check before anything is deleted: our exe and uninstaller are inside, and it isn't
-    a drive root."""
+    """An installation of ours: our exe and uninstaller are inside. (The folder may also hold
+    other things, e.g. a drive root: only our own files are ever removed, see program_files().)"""
     return (
         bool(path)
-        and len(path) > 3
         and os.path.isfile(os.path.join(path, APP_EXE))
         and os.path.isfile(os.path.join(path, UNINSTALL_EXE))
-        and shared_folder_reason(path) is None
     )
+
+
+# ------------------------------ Program files ------------------------------
+# Uninstalling (and moving an installation elsewhere) removes only the installation's own files,
+# then the folders that became empty, the installation folder included. Never anything else, and
+# never a folder with anything left in it.
+
+PROGRAM_SUBFOLDER = "_internal"   # the app's libraries (PyInstaller)
+PENDING_EXE = APP_EXE + ".new"    # the app's own exe with an updated icon, until it's swapped in
+STAGING_PREFIX = f".{APP_NAME}-removing"   # see set_aside()
+# The --log files of the app and the uninstaller, when started in their folder (see start_log())
+APP_LOGS = [APP_NAME + ".log", APP_NAME + ".log.old"]
+UNINSTALL_LOGS = [os.path.splitext(UNINSTALL_EXE)[0] + ".log", os.path.splitext(UNINSTALL_EXE)[0] + ".log.old"]
+
+
+def program_files(install_dir):
+    """The program files of the installation that exist, as paths relative to its folder: the
+    exes, icon.ico, a pending exe, the log files, everything in _internal, and the folder's
+    shortcut if it points at this installation. (The installer refuses a folder where another
+    program already has files by these names, see installer.name_clashes().)"""
+    files = [name for name in [APP_EXE, UNINSTALL_EXE, "icon.ico", PENDING_EXE] + APP_LOGS + UNINSTALL_LOGS
+             if os.path.isfile(os.path.join(install_dir, name))]
+    for root, _, names in os.walk(os.path.join(install_dir, PROGRAM_SUBFOLDER)):
+        files += [os.path.relpath(os.path.join(root, n), install_dir) for n in names]
+    shortcut = os.path.join(install_dir, SHORTCUT_NAME)
+    if os.path.isfile(shortcut) and shortcut_is_ours(shortcut, read_shortcut_targets([shortcut]), install_dir):
+        files.append(SHORTCUT_NAME)
+    return files
+
+
+def leftovers(install_dir, later=()):
+    """What's still in an installation folder besides its program files (and the ones in `later`,
+    deleted once the uninstaller has exited): things that aren't ours, which are left alone, and so
+    the folder stays."""
+    skip = {n.lower() for n in later}
+    try:
+        return sorted(n for n in os.listdir(install_dir)
+                      if n.lower() not in skip and not n.startswith(STAGING_PREFIX))
+    except OSError:
+        return []
+
+
+def leftovers_warning(install_dir):
+    """The warning shown for leftovers()."""
+    return (f"Some files were left in {install_dir}, because they aren't part of {APP_NAME}")
+
+
+class SetAsideError(Exception):
+    """A program file couldn't be moved aside (see set_aside()): .name, .error."""
+
+    def __init__(self, name, error):
+        super().__init__(f"{name}: {error}")
+        self.name, self.error = name, error
+
+
+def retry(action, tries=6):
+    """Run action(), retrying briefly: files can stay locked for a moment after a program exits."""
+    for i in range(tries):
+        try:
+            return action()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            if i == tries - 1:
+                raise
+            time.sleep(0.5)
+
+
+def set_aside(install_dir, rels):
+    """Move these program files into a new staging folder inside the installation folder, one
+    rename each. A rename fails just like a delete would (a file in use, access denied): then
+    everything is moved back and SetAsideError is raised, and nothing at all has changed.
+    Returns (staging folder, the files moved), for finish_removal() or put_back()."""
+    staging = os.path.join(install_dir, STAGING_PREFIX)
+    n = 1
+    while os.path.exists(staging):
+        n += 1
+        staging = os.path.join(install_dir, f"{STAGING_PREFIX}{n}")
+    os.mkdir(staging)
+    moved = []
+    for rel in rels:
+        src, dst = os.path.join(install_dir, rel), os.path.join(staging, rel)
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            retry(lambda: os.rename(src, dst))
+        except OSError as e:
+            log(f"Couldn't move {src} aside: {e}; moving everything back.")
+            put_back(install_dir, staging, moved)
+            raise SetAsideError(rel, e) from e
+        moved.append(rel)
+    return staging, moved
+
+
+def _folders_of(base, rels):
+    """The folders between base and these files (base itself not included), deepest first."""
+    folders = set()
+    for rel in rels:
+        parent = os.path.dirname(rel)
+        while parent:
+            folders.add(os.path.join(base, parent))
+            parent = os.path.dirname(parent)
+    return sorted(folders, key=lambda f: f.count(os.sep), reverse=True)
+
+
+def _remove_empty(folders):
+    for folder in folders:
+        try:
+            os.rmdir(folder)   # only ever succeeds on an empty folder
+        except OSError:
+            pass
+
+
+def remove_empty_folders(base, rels, folder_too=False):
+    """Remove the folders these files were in (relative to base) if they're empty now, and base
+    itself too if asked (again only if empty)."""
+    _remove_empty(_folders_of(base, rels) + ([base] if folder_too else []))
+
+
+def put_back(install_dir, staging, moved):
+    """Undo set_aside()."""
+    for rel in reversed(moved):
+        try:
+            os.makedirs(os.path.dirname(os.path.join(install_dir, rel)), exist_ok=True)
+            os.rename(os.path.join(staging, rel), os.path.join(install_dir, rel))
+        except OSError as e:
+            log(f"Couldn't move {rel} back: {e}")
+    # (also the folders made for a file that then couldn't be moved)
+    _remove_empty([root for root, _, _ in os.walk(staging, topdown=False)])
+
+
+def finish_removal(install_dir, staging, moved, later=()):
+    """Delete the files set aside, then the folders that became empty (the staging folder, the
+    program's subfolders, and the installation folder itself, only if nothing else is left in it).
+    Files in `later` (still in the installation folder, e.g. the running uninstaller) and any file
+    that's still locked are deleted by a helper once this program has exited, which then removes
+    the empty folders the same way."""
+    left = [os.path.join(install_dir, rel) for rel in later]
+    for rel in moved:
+        path = os.path.join(staging, rel)
+        try:
+            retry(lambda: os.remove(path))
+        except PermissionError:
+            try:
+                os.chmod(path, 0o666)   # read-only
+                os.remove(path)
+            except OSError:
+                left.append(path)
+        except OSError:
+            left.append(path)
+    folders = (_folders_of(staging, moved) + [staging]
+               + _folders_of(install_dir, list(moved) + list(later)) + [install_dir])
+    _remove_empty(folders)   # the ones that are empty already
+    if left:
+        log("Deleting once this program exits: " + ", ".join(left))
+        remove_after_exit(left, [f for f in folders if os.path.isdir(f)])
 
 
 def known_folder(csidl):
@@ -378,11 +510,33 @@ def signal_handoff():
         close_handle(event)
 
 
+_ui_scale = 1.0   # display scaling (1.0 = 100 %, 2.0 = 200 % on a 4K screen), see px()
+
+
 def set_dpi_aware():
+    """Draw the windows sharp at any display scaling (instead of Windows stretching them blurry),
+    and remember the scaling for px()."""
+    global _ui_scale
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)   # system DPI aware
     except Exception:
         pass
+    try:
+        _ui_scale = ctypes.windll.user32.GetDpiForSystem() / 96
+    except Exception:
+        try:
+            dc = ctypes.windll.user32.GetDC(None)
+            _ui_scale = ctypes.windll.gdi32.GetDeviceCaps(dc, 88) / 96   # LOGPIXELSX
+            ctypes.windll.user32.ReleaseDC(None, dc)
+        except Exception:
+            pass
+
+
+def px(*sizes):
+    """Sizes given in pixels at 100 % display scaling, in real pixels for this display (fonts
+    scale by themselves, pixel sizes don't). One size gives a number, several a tuple."""
+    scaled = tuple(round(size * _ui_scale) for size in sizes)
+    return scaled[0] if len(scaled) == 1 else scaled
 
 
 def _q(s):
@@ -538,6 +692,7 @@ def apply_theme(root):
         # The theme sets its colours and fonts when the main window gets <<ThemeChanged>>, which a
         # hidden main window (an error dialog on its own) never does: do it directly
         root.tk.call("configure_colors")
+        _scale_theme(root)
     except Exception:
         dark = False   # the classic theme only comes in light
         try:
@@ -546,6 +701,21 @@ def apply_theme(root):
             pass
     root._theme_dark = dark   # for show_window() and dialog()
     return {"warning": "#f0b060" if dark else "#9a5b00"}
+
+
+def _scale_theme(root):
+    """The Sun Valley theme is made for 100 % display scaling: its fonts are sized in pixels
+    (negative sizes), so scale them by px(). (Its controls are images that stretch to fit the
+    text; only the checkbox squares keep their size.)"""
+    if _ui_scale == 1.0 or getattr(root, "_theme_scaled", False):
+        return
+    root._theme_scaled = True
+    tk = root.tk
+    for name in tk.splitlist(tk.call("font", "names")):
+        if str(name).startswith("SunValley"):
+            size = int(tk.call("font", "configure", name, "-size"))
+            if size < 0:
+                tk.call("font", "configure", name, "-size", -px(-size))
 
 
 def show_window(window):
@@ -576,16 +746,16 @@ def dialog(parent, title, text, buttons=("OK",), default=0):
         result[0] = index
         win.destroy()
 
-    frame = ttk.Frame(win, padding=(22, 20))
+    frame = ttk.Frame(win, padding=px(22, 20))
     frame.pack(fill="both", expand=True)
-    ttk.Label(frame, text=text, wraplength=420, justify="left").pack(anchor="w")
+    ttk.Label(frame, text=text, wraplength=px(420), justify="left").pack(anchor="w")
     row = ttk.Frame(frame)
-    row.pack(fill="x", pady=(20, 0))
+    row.pack(fill="x", pady=px(20, 0))
     accent = ttk.Style(win).theme_use().startswith("sun-valley")   # the classic theme has no accent style
     for index, label in reversed(list(enumerate(buttons))):
         button = ttk.Button(row, text=label, command=lambda i=index: choose(i),
                             style="Accent.TButton" if accent and index == default else "TButton")
-        button.pack(side="right", padx=(8, 0))
+        button.pack(side="right", padx=px(8, 0))
         if index == default:
             button.focus_set()
     win.bind("<Return>", lambda e: choose(default))
@@ -610,9 +780,11 @@ def dialog(parent, title, text, buttons=("OK",), default=0):
 
 def size_window(root, width, pages, min_height=0):
     """Fix the window at this width and the height of its tallest page (themes differ in how much
-    room their controls need), centred a bit above the middle of the screen."""
+    room their controls need), centred a bit above the middle of the screen. Sizes are as for
+    px()."""
     root.update_idletasks()
-    height = max([min_height] + [page.winfo_reqheight() for page in pages])
+    width = px(width)
+    height = max([px(min_height)] + [page.winfo_reqheight() for page in pages])
     x = (root.winfo_screenwidth() - width) // 2
     y = (root.winfo_screenheight() - height) // 3
     root.geometry(f"{width}x{height}+{x}+{y}")
@@ -689,27 +861,23 @@ def run_after_exit(script):
     )
 
 
-def delete_tree(path):
-    """Delete a folder, including read-only files in it."""
-    import shutil
-    import stat
-
-    def clear_read_only(func, p, _exc):
-        os.chmod(p, stat.S_IWRITE)
-        func(p)
-    shutil.rmtree(path, onexc=clear_read_only) if sys.version_info >= (3, 12) \
-        else shutil.rmtree(path, onerror=clear_read_only)
-
-
-def delete_after_exit(path):
-    """Delete a file or folder (recursively) once this program has exited."""
+def remove_after_exit(files, folders=()):
+    """Once this program has exited: delete these files, then these folders, each only if it's
+    empty by then (never anything inside them). Retries for a while if a file stays locked."""
+    listed = lambda paths: ",".join("'%s'" % _q(p) for p in paths)
     run_after_exit(
-        "$t = '%s';"
+        "$files = @(%s); $folders = @(%s);"
         "for ($i = 0; $i -lt 60; $i++) {"
-        " Remove-Item -LiteralPath $t -Recurse -Force -ErrorAction SilentlyContinue;"
-        " if (-not (Test-Path -LiteralPath $t)) { break };"
+        " $left = $false;"
+        " foreach ($f in $files) { if (Test-Path -LiteralPath $f -PathType Leaf) {"
+        "  Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue;"
+        "  if (Test-Path -LiteralPath $f -PathType Leaf) { $left = $true } } };"
+        " if (-not $left) { break };"
         " Start-Sleep -Milliseconds 500"
-        "}" % _q(path))
+        "};"
+        # Directory.Delete(path, false) refuses a folder that isn't empty
+        "foreach ($d in $folders) { try { [System.IO.Directory]::Delete($d, $false) } catch {} }"
+        % (listed(files), listed(folders)))
 
 
 def replace_after_exit(src, dst):

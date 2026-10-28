@@ -4,7 +4,6 @@ import os
 import queue
 import sys
 import threading
-import time
 import traceback
 
 import tkinter as tk
@@ -26,73 +25,20 @@ def find_install_dir():
     return None
 
 
-STAGING_DIR = ".uninstalling"   # inside the installation folder, see set_aside_program_files()
-
-
 class UninstallAborted(Exception):
     """The program files couldn't all be removed, so nothing was changed."""
 
 
-def retry(action, tries=6):
-    """Run action(), retrying briefly: files can stay locked for a moment after a program exits."""
-    for i in range(tries):
-        try:
-            return action()
-        except FileNotFoundError:
-            return None
-        except OSError:
-            if i == tries - 1:
-                raise
-            time.sleep(0.5)
-
-
-def set_aside_program_files(install_dir):
-    """Move everything in the installation folder (except this uninstaller) into a staging
-    subfolder, one rename each. A rename fails just like a delete would (a file in use, access
-    denied), so if anything can't be moved, everything is moved back and UninstallAborted is raised:
-    then nothing at all has been changed. Returns the staging folder."""
-    staging = os.path.join(install_dir, STAGING_DIR)
-    os.makedirs(staging, exist_ok=True)
-    own_name = common.UNINSTALL_EXE.lower()
-    moved = []
-    try:
-        for name in os.listdir(install_dir):
-            if name.lower() in (own_name, STAGING_DIR):
-                continue
-            src, dst = os.path.join(install_dir, name), os.path.join(staging, name)
-            try:
-                retry(lambda: os.rename(src, dst))
-            except OSError as e:
-                common.log(f"Couldn't move {src}: {e}; moving everything back.")
-                raise UninstallAborted(
-                    f"{common.APP_NAME} wasn't uninstalled, because {name} couldn't be removed "
-                    f"({common.friendly_error(e)}). Nothing was changed.\n\nIf {common.APP_NAME} or "
-                    f"anything else in its folder is still open, close it and try again.") from e
-            moved.append((src, dst))
-    except UninstallAborted:
-        for src, dst in reversed(moved):
-            try:
-                os.rename(dst, src)
-            except OSError:
-                pass
-        try:
-            os.rmdir(staging)
-        except OSError:
-            pass
-        raise
-    return staging
-
-
-def spawn_self_delete(install_dir):
-    """uninstall.exe can't delete itself while running, so a hidden helper waits until every
-    uninstall.exe process has exited (however long the window stays open), then removes the
-    now unlocked folder."""
-    os.chdir(os.environ.get("SystemRoot", "C:\\Windows"))   # our own CWD must not be inside the folder
-    common.delete_after_exit(install_dir)
+# This uninstaller and its own log (with --log, it may still be writing it) are deleted last,
+# once it has exited
+DELETED_LAST = [common.UNINSTALL_EXE] + common.UNINSTALL_LOGS
 
 
 def uninstall(install_dir, status, progress):
-    """Returns a list of warnings. Refuses to touch anything that doesn't look like our folder."""
+    """Removes the program files (only those, see common.program_files()), shortcuts and the
+    "installed apps" entry, then the folder if nothing else is in it. Returns warnings (also
+    for anything left in the folder that isn't ours). Refuses to touch anything that doesn't look
+    like our folder."""
     if not common.is_valid_install_dir(install_dir):
         raise RuntimeError(f"This doesn't look like a {common.APP_NAME} installation folder; nothing was removed.")
     warnings = []
@@ -101,9 +47,17 @@ def uninstall(install_dir, status, progress):
     common.stop_app(install_dir)
     progress(0.05)
 
-    # All or nothing: if any program file can't be removed, stop before changing anything
+    # All or nothing: if any program file can't be removed, stop before changing anything.
     status("Checking that all program files can be removed...")
-    staging = set_aside_program_files(install_dir)
+    last = {n.lower() for n in DELETED_LAST}
+    files = [rel for rel in common.program_files(install_dir) if rel.lower() not in last]
+    try:
+        staging, moved = common.set_aside(install_dir, files)
+    except common.SetAsideError as e:
+        raise UninstallAborted(
+            f"{common.APP_NAME} wasn't uninstalled, because {e.name} couldn't be removed "
+            f"({common.friendly_error(e.error)}). Nothing was changed.\n\nIf {common.APP_NAME} is "
+            "still open, or a file of it is open in another program, close it and try again.") from e
     progress(0.1)
 
     shortcuts = common.installed_shortcuts(install_dir)
@@ -122,17 +76,20 @@ def uninstall(install_dir, status, progress):
     progress(0.4)
 
     status("Deleting program files...")
-    try:
-        retry(lambda: common.delete_tree(staging))
-    except OSError as e:
-        # whatever is left goes with the rest of the folder once the uninstaller exits
-        common.log(f"Some program files are still locked ({e}); they go with the folder.")
+    os.chdir(os.environ.get("SystemRoot", "C:\\Windows"))   # our own CWD must not keep the folder
+    # uninstall.exe can't delete itself while running: a hidden helper does that once every
+    # uninstall.exe process has exited (however long the window stays open), then removes the
+    # folder if it's empty
+    common.finish_removal(install_dir, staging, moved, later=DELETED_LAST)
     progress(0.9)
 
     status("Finishing up...")
-    spawn_self_delete(install_dir)   # removes uninstall.exe and the folder itself once we exit
     common.notify_icon_change()
     progress(1.0)
+    kept = common.leftovers(install_dir, later=DELETED_LAST)
+    if kept:
+        common.log("The folder stays, it has other things in it: " + ", ".join(kept))
+        warnings.append(common.leftovers_warning(install_dir))
     return warnings
 
 
@@ -159,34 +116,35 @@ class UninstallerApp:
         self.show(self.page_confirm)
 
     def _build_confirm(self):
-        f = ttk.Frame(self.root, padding=20)
+        f = ttk.Frame(self.root, padding=common.px(20))
         ttk.Label(f, text=f"Uninstall {common.APP_NAME}", font=("Segoe UI", 15, "bold")).pack(anchor="w")
-        ttk.Label(f, wraplength=490, justify="left", text="Are you sure you want to uninstall?").pack(anchor="w", pady=(10, 4))
-        ttk.Label(f, wraplength=490, justify="left", text="This will remove:").pack(anchor="w", pady=(10, 4))
-        lines = [f"- the installation folder at {self.install_dir}", "- the Windows app list entry"]
+        ttk.Label(f, wraplength=common.px(490), justify="left", text="Are you sure you want to uninstall?").pack(anchor="w", pady=common.px(10, 4))
+        ttk.Label(f, wraplength=common.px(490), justify="left", text="This will remove:").pack(anchor="w", pady=common.px(10, 4))
+        lines = [f"- its program files in {self.install_dir}",
+                 "- the Windows app list entry"]
         lines += [f"- the {label} shortcut" for label, _ in self.shortcuts]
-        ttk.Label(f, wraplength=490, justify="left", text="\n".join(lines)).pack(anchor="w", padx=(10, 0))
+        ttk.Label(f, wraplength=common.px(490), justify="left", text="\n".join(lines)).pack(anchor="w", padx=common.px(10, 0))
         btns = ttk.Frame(f)
         btns.pack(side="bottom", fill="x")
         ttk.Button(btns, text="Cancel", command=self.root.destroy).pack(side="right")
-        ttk.Button(btns, text="Uninstall", command=self.on_uninstall).pack(side="right", padx=8)
+        ttk.Button(btns, text="Uninstall", command=self.on_uninstall).pack(side="right", padx=common.px(8))
         return f
 
     def _build_progress(self):
-        f = ttk.Frame(self.root, padding=20)
+        f = ttk.Frame(self.root, padding=common.px(20))
         ttk.Label(f, text="Uninstalling...", font=("Segoe UI", 15, "bold")).pack(anchor="w")
-        ttk.Label(f, textvariable=self.var_status, wraplength=490).pack(anchor="w", pady=(20, 8))
-        self.bar = ttk.Progressbar(f, maximum=100, length=480)
+        ttk.Label(f, textvariable=self.var_status, wraplength=common.px(490)).pack(anchor="w", pady=common.px(20, 8))
+        self.bar = ttk.Progressbar(f, maximum=100, length=common.px(480))
         self.bar.pack(anchor="w")
         return f
 
     def _build_done(self):
-        f = ttk.Frame(self.root, padding=20)
+        f = ttk.Frame(self.root, padding=common.px(20))
         ttk.Label(f, text=f"{common.APP_NAME} has been uninstalled", font=("Segoe UI", 15, "bold")).pack(anchor="w")
-        self.lbl_done = ttk.Label(f, wraplength=490, justify="left")
-        self.lbl_done.pack(anchor="w", pady=(14, 16))
+        self.lbl_done = ttk.Label(f, wraplength=common.px(490), justify="left")
+        self.lbl_done.pack(anchor="w", pady=common.px(14, 16))
         # Problems (e.g. a shortcut that couldn't be removed), shown like the installer shows its own
-        self.lbl_warn = ttk.Label(f, wraplength=490, justify="left", foreground=self.colors["warning"])
+        self.lbl_warn = ttk.Label(f, wraplength=common.px(490), justify="left", foreground=self.colors["warning"])
         self.lbl_warn.pack(anchor="w")
         btns = ttk.Frame(f)
         btns.pack(side="bottom", fill="x")
@@ -231,12 +189,9 @@ class UninstallerApp:
                     self.bar["value"] = val * 100
                 elif kind == "done":
                     self.working = False
-                    # (program files are all removed or the uninstall stops: only shortcuts can be left)
-                    if not val:
-                        text = "The program was fully removed from your system."
-                    else:
-                        text = "The program was removed, but the shortcuts below couldn't be. You can delete them yourself."
-                    text += "\n\nThe uninstaller will also be gone after you close this window."
+                    # (program files are all removed or the uninstall stops: only shortcuts, and
+                    # files that aren't ours, can be left)
+                    text = "The program was fully removed from your system.\n\nThe uninstaller will also be gone after you close this window."
                     self.lbl_done.config(text=text)
                     self.lbl_warn.config(text="\n".join("- " + w for w in val))
                     self.show(self.page_done)
